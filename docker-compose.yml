@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  sunat-worker:
+    build: .
+    container_name: backend_estado_factura_sunat
+    restart: always       # reinicia incluso si falla
+    env_file:
+      - .env              # tu archivo con SQL_SERVER, SUNAT_CLIENT_ID, etc.
+    volumes:
+      - .:/app            # monta código local para fácil edición
