@@ -50,7 +50,8 @@ def _pick_sql_driver():
     prefs = ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server"]
     installed = [d.strip() for d in pyodbc.drivers()]
     for p in prefs:
-        if p in installed: return p
+        if p in installed:
+            return p
     raise RuntimeError(f"No se encontró un driver ODBC 17/18. Detectados: {installed}")
 
 def _effective_driver():
@@ -69,7 +70,8 @@ def _require_env(name, default=None):
     return str(val).strip()
 
 def _server_part(host, port):
-    if "\\" in host: return host
+    if "\\" in host:
+        return host
     return f"{host},{port}" if port else host
 
 def _diagnose_dns(host):
@@ -107,14 +109,14 @@ def sql_cnx():
     )
     logging.info(f"Conectando a SQL con driver '{driver}' -> SERVER={server}, DB={db}")
     cnx = pyodbc.connect(cs, autocommit=False)
-    # Nivel de aislamiento conservador y seguro
     cnx.autocommit = False
     return cnx
 
 # -------------- OAuth token --------------
 def _token_try(url, scope, auth_mode, cid, sec):
     payload = {"grant_type": "client_credentials"}
-    if scope: payload["scope"] = scope
+    if scope:
+        payload["scope"] = scope
     headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
     auth = (cid, sec) if auth_mode == "basic" else None
     body = payload if auth_mode == "basic" else {**payload, "client_id": cid, "client_secret": sec}
@@ -188,11 +190,19 @@ def to_body_postman(row):
         else:
             fecha_str = datetime.datetime.strptime(str(femi), "%Y-%m-%d").strftime("%d/%m/%Y")
     monto = "0.00" if tot is None else str(Decimal(tot).quantize(Decimal("0.00"), rounding=ROUND_HALF_UP))
-    return {"numRuc": ruc_em, "codComp": tip, "numeroSerie": ser, "numero": num, "fechaEmision": fecha_str, "monto": monto}
+    return {
+        "numRuc": ruc_em,
+        "codComp": tip,
+        "numeroSerie": ser,
+        "numero": num,
+        "fechaEmision": fecha_str,
+        "monto": monto
+    }
 
 # -------------- Estado SUNAT -------------
 def _as_str(v):
-    if v is None: return None
+    if v is None:
+        return None
     try:
         return str(int(v))
     except Exception:
@@ -301,17 +311,12 @@ WHERE IdFactura=?""",
 def update_final_from_snapshot(cnx):
     """
     Actualiza SOLO columnas SUNAT_* en DATA.FACTURA_COMPRA_BACKUS_CABECERA
-    a partir de INH.SUNAT_ESTADO_ACTUAL. Evita bloqueos largos y no toca
-    totales ni demás columnas del negocio.
+    desde INH.SUNAT_ESTADO_ACTUAL usando OUTPUT a #upd para tener un result set
+    confiable (evita 'No results. Previous SQL was not a query').
     """
     cur = cnx.cursor()
-    # Aseguramos NOCOUNT ON para contar filas correctamente en pyodbc
-    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
 
-    # Forzar nivel de aislamiento razonable
-    cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED;")
-
-    # UPDATE idempotente
+    # 1) Diagnóstico previo (opcional pero útil)
     cur.execute(f"""
 ;WITH SRC AS (
     SELECT
@@ -326,25 +331,70 @@ def update_final_from_snapshot(cnx):
         s.Cambio_Estado
     FROM {T_SNAPSHOT} s WITH (NOLOCK)
 )
-UPDATE D
-   SET D.Estado_SUNAT_ULT         = SRC.Estado_Actual,
-       D.Estado_SUNAT_Descripcion = SRC.Estado_Descripcion,
-       D.SUNAT_Codigo_Respuesta   = SRC.Codigo_Respuesta,
-       D.SUNAT_Mensaje            = SRC.Mensaje,
-       D.SUNAT_Cambio_Estado      = CASE WHEN SRC.Cambio_Estado = 1 THEN 1 ELSE 0 END,
-       D.SUNAT_Fecha_Primera      = COALESCE(D.SUNAT_Fecha_Primera, SRC.Fecha_Primera_Consulta),
-       D.SUNAT_Fecha_Ultima       = SRC.Fecha_Ultima_Consulta,
-       D.SUNAT_Fecha_Cambio       = CASE WHEN SRC.Cambio_Estado = 1
-                                         THEN SRC.Fecha_Ultimo_Cambio
-                                         ELSE D.SUNAT_Fecha_Cambio
-                                    END
-  FROM {T_FINAL} AS D WITH (ROWLOCK)
-  JOIN SRC ON SRC.IdFactura = D.IdFactura;
+SELECT COUNT(*)
+FROM {T_FINAL} d
+JOIN SRC s ON s.IdFactura = d.IdFactura
+WHERE
+    ISNULL(d.Estado_SUNAT_ULT,'')         <> ISNULL(s.Estado_Actual,'')
+ OR ISNULL(d.Estado_SUNAT_Descripcion,'') <> ISNULL(s.Estado_Descripcion,'')
+ OR ISNULL(CAST(d.SUNAT_Cambio_Estado AS int),-1) <> ISNULL(s.Cambio_Estado,0)
+ OR ISNULL(d.SUNAT_Codigo_Respuesta,'')   <> ISNULL(s.Codigo_Respuesta,'')
+ OR ISNULL(d.SUNAT_Mensaje,'')            <> ISNULL(s.Mensaje,'')
+ OR (d.SUNAT_Fecha_Primera IS NULL AND s.Fecha_Primera_Consulta IS NOT NULL)
+ OR (d.SUNAT_Fecha_Primera IS NOT NULL AND s.Fecha_Primera_Consulta IS NULL)
+ OR (d.SUNAT_Fecha_Primera IS NOT NULL AND s.Fecha_Primera_Consulta IS NOT NULL AND d.SUNAT_Fecha_Primera <> s.Fecha_Primera_Consulta)
+ OR (d.SUNAT_Fecha_Ultima  IS NULL AND s.Fecha_Ultima_Consulta  IS NOT NULL)
+ OR (d.SUNAT_Fecha_Ultima  IS NOT NULL AND s.Fecha_Ultima_Consulta  IS NULL)
+ OR (d.SUNAT_Fecha_Ultima  IS NOT NULL AND s.Fecha_Ultima_Consulta  IS NOT NULL AND d.SUNAT_Fecha_Ultima  <> s.Fecha_Ultima_Consulta)
+ OR (s.Cambio_Estado = 1 AND (d.SUNAT_Fecha_Cambio IS NULL OR d.SUNAT_Fecha_Cambio <> s.Fecha_Ultimo_Cambio));
 """)
-    rows = cur.rowcount
-    cur.close()
+    to_fix = cur.fetchone()[0]
+    logging.info(f"[FINAL] Filas con diferencias a actualizar: {to_fix}")
+
+    # 2) UPDATE con OUTPUT a temp table y SELECT COUNT(*) (un solo result set)
+    cur.execute(f"""
+SET XACT_ABORT ON;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+IF OBJECT_ID('tempdb..#upd') IS NOT NULL DROP TABLE #upd;
+CREATE TABLE #upd (IdFactura INT PRIMARY KEY);
+
+;WITH SRC AS (
+    SELECT
+        s.IdFactura,
+        s.Estado_Actual,
+        s.Estado_Descripcion,
+        s.Codigo_Respuesta,
+        s.Mensaje,
+        s.Fecha_Primera_Consulta,
+        s.Fecha_Ultima_Consulta,
+        s.Fecha_Ultimo_Cambio,
+        s.Cambio_Estado
+    FROM {T_SNAPSHOT} s WITH (NOLOCK)
+)
+UPDATE d
+   SET d.Estado_SUNAT_ULT         = s.Estado_Actual,
+       d.Estado_SUNAT_Descripcion = s.Estado_Descripcion,
+       d.SUNAT_Codigo_Respuesta   = s.Codigo_Respuesta,
+       d.SUNAT_Mensaje            = s.Mensaje,
+       d.SUNAT_Cambio_Estado      = CASE WHEN s.Cambio_Estado = 1 THEN 1 ELSE 0 END,
+       d.SUNAT_Fecha_Primera      = COALESCE(d.SUNAT_Fecha_Primera, s.Fecha_Primera_Consulta),
+       d.SUNAT_Fecha_Ultima       = s.Fecha_Ultima_Consulta,
+       d.SUNAT_Fecha_Cambio       = CASE WHEN s.Cambio_Estado = 1
+                                         THEN s.Fecha_Ultimo_Cambio
+                                         ELSE d.SUNAT_Fecha_Cambio
+                                    END
+  OUTPUT inserted.IdFactura INTO #upd(IdFactura)
+  FROM {T_FINAL} AS d WITH (ROWLOCK)
+  JOIN SRC s ON s.IdFactura = d.IdFactura;
+
+SELECT COUNT(*) AS Affected FROM #upd;
+""")
+    affected = cur.fetchone()[0] if cur.description else 0
+
     cnx.commit()
-    logging.info(f"[FINAL] Columnas SUNAT actualizadas en {rows if rows is not None else 0} filas de {T_FINAL}")
+    cur.close()
+    logging.info(f"[FINAL] Columnas SUNAT actualizadas en {affected} filas de {T_FINAL}")
 
 # -------------- Cola status --------------
 def mark_done(cnx, idq, _unused=None):
@@ -384,7 +434,7 @@ def process_batch(cnx):
                 cnx.commit()
                 err_cnt += 1
 
-    # <<< AQUÍ: Python actualiza la tabla final >>>
+    # Actualiza tabla final desde Python (idempotente)
     try:
         update_final_from_snapshot(cnx)
     except Exception:
