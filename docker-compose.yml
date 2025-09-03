@@ -1,11 +1,12 @@
-version: "3.9"
-
 services:
   sunat-worker:
     build: .
-    container_name: backend_estado_factura_sunat
-    restart: always       # reinicia incluso si falla
+    container_name: sunat_worker
+    restart: always
     env_file:
-      - .env              # tu archivo con SQL_SERVER, SUNAT_CLIENT_ID, etc.
+      - .env
     volumes:
-      - .:/app            # monta código local para fácil edición
+      - .:/app
+    # Si tu SQL Server está en la red del host y necesitas DNS/hosts específicos, puedes añadir:
+    # extra_hosts:
+    #   - "sqlserver.local:192.168.10.202"
