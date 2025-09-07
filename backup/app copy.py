@@ -1,21 +1,18 @@
-# -*- coding: utf-8 -*-
 import os, json, time, logging, datetime, threading, socket
 from pathlib import Path
-from decimal import Decimal, ROUND_HALF_UP
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests, pyodbc
 from dotenv import load_dotenv
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None  # (si usas Python <3.9, instala backports.zoneinfo)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, ROUND_HALF_UP
 
-# ---------------- .env ----------------
+# ---------------- Carga .env ----------------
 ENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(ENV_PATH, override=False)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 print(f"[ENV] Cargando .env desde: {ENV_PATH} (existe={ENV_PATH.exists()})")
+
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # ---------------- Config -----------------
 SQL_SERVER   = os.getenv("SQL_SERVER")
@@ -34,34 +31,19 @@ WORKER_THREADS = int(os.getenv("WORKER_THREADS", "10"))
 RETRY_MAX      = int(os.getenv("RETRY_MAX", "3"))
 HTTP_TIMEOUT   = int(os.getenv("HTTP_TIMEOUT", "25"))
 
-ONE_SHOT       = int(os.getenv("ONE_SHOT", "1"))
-MAX_IDLE_SEC   = int(os.getenv("MAX_IDLE_SEC", "30"))
-IDLE_SLEEP_SEC = int(os.getenv("IDLE_SLEEP_SEC", "5"))
-
-# Zona horaria Lima
-LIMA_TZ = ZoneInfo("America/Lima") if ZoneInfo else None
-
-# API
+# API de validación
 VALIDA_URL = f"https://api.sunat.gob.pe/v1/contribuyente/contribuyentes/{RUC_CONTRIB}/validarcomprobante"
 
 # Tablas
 T_QUEUE     = "INH.API_SUNAT_QUEUE"
 T_HIST      = "INH.SUNAT_VALIDACION"
 T_SNAPSHOT  = "INH.SUNAT_ESTADO_ACTUAL"
-T_FINAL     = "DATA.FACTURA_COMPRA_BACKUS_CABECERA"
+T_FINAL     = "DATA.FACTURA_COMPRA_BACKUS_CABECERA"  # columnas SUNAT_* aquí
 
 # -------------- Token cache --------------
 _token_lock   = threading.Lock()
 _cached_token = None
 _token_exp    = datetime.datetime.now(datetime.timezone.utc)
-
-# -------------- Util: hora Lima --------------
-def now_lima_naive():
-    """Retorna datetime naive en America/Lima (para guardar en SQL)."""
-    if LIMA_TZ:
-        return datetime.datetime.now(LIMA_TZ).replace(tzinfo=None)
-    # Fallback: sin zoneinfo, usa hora local del sistema
-    return datetime.datetime.now()
 
 # -------------- SQL helpers --------------
 def _pick_sql_driver():
@@ -73,7 +55,7 @@ def _pick_sql_driver():
     raise RuntimeError(f"No se encontró un driver ODBC 17/18. Detectados: {installed}")
 
 def _effective_driver():
-    wanted = (SQL_DRIVER or "").strip()
+    wanted = os.getenv("SQL_DRIVER")
     installed = [d.strip() for d in pyodbc.drivers()]
     if wanted and wanted in installed:
         return wanted
@@ -131,78 +113,56 @@ def sql_cnx():
     return cnx
 
 # -------------- OAuth token --------------
-def _token_post(url, payload, use_basic):
+def _token_try(url, scope, auth_mode, cid, sec):
+    payload = {"grant_type": "client_credentials"}
+    if scope:
+        payload["scope"] = scope
     headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
-    auth = (CLIENT_ID, CLIENT_SECRET) if use_basic else None
-    data = payload.copy()
-    if not use_basic:
-        data["client_id"] = CLIENT_ID
-        data["client_secret"] = CLIENT_SECRET
-    return requests.post(url, data=data, headers=headers, auth=auth, timeout=HTTP_TIMEOUT)
+    auth = (cid, sec) if auth_mode == "basic" else None
+    body = payload if auth_mode == "basic" else {**payload, "client_id": cid, "client_secret": sec}
+    return requests.post(url, data=body, headers=headers, auth=auth, timeout=HTTP_TIMEOUT)
 
 def get_token():
-    """
-    Prioriza el flujo que te funcionó:
-      - endpoint clientesextranet + auth=body + scope=contribuyentes
-    Luego hace fallback a otras combinaciones pero sin spamear warnings.
-    """
     global _cached_token, _token_exp
     cid = (CLIENT_ID or "").strip()
     sec = (CLIENT_SECRET or "").strip()
     if not cid or not sec:
         raise RuntimeError("Faltan SUNAT_CLIENT_ID o SUNAT_CLIENT_SECRET en el .env")
-
     with _token_lock:
         if _cached_token and (_token_exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds() > 60:
             return _cached_token, _token_exp
 
         endpoints = [
-            f"https://api-seguridad.sunat.gob.pe/v1/clientesextranet/{cid}/oauth2/token/",
             f"https://api-seguridad.sunat.gob.pe/v1/clientessol/{cid}/oauth2/token/",
+            f"https://api-seguridad.sunat.gob.pe/v1/clientesextranet/{cid}/oauth2/token/",
         ]
         scopes = [
             "https://api.sunat.gob.pe/v1/contribuyente/contribuyentes",
             "https://api.sunat.gob.pe/v1/contribuyente/*",
             None,
         ]
+        auth_modes = ["basic", "body"]
 
-        # 1) Intento “bueno conocido”: clientesextranet + BODY + scope principal
-        try:
-            r = _token_post(endpoints[0], {"grant_type": "client_credentials", "scope": scopes[0]}, use_basic=False)
-            if r.status_code == 200:
-                js = r.json()
-                _cached_token = js["access_token"]
-                _token_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-                    seconds=int(js.get("expires_in", 0)) or 0
-                )
-                logging.info("Token SUNAT renovado (endpoint=clientesextranet, auth=body, scope=contribuyentes)")
-                return _cached_token, _token_exp
-            logging.warning(f"Token fail primario: HTTP {r.status_code} - {r.text[:400]}")
-        except requests.RequestException as e:
-            logging.warning(f"Token exception primario: {repr(e)}")
-
-        # 2) Fallbacks (pocos, para no llenar el log)
+        last_err = None
         for ep in endpoints:
-            for sc in scopes[1:]:
-                for use_basic in (False, True):
+            for auth_mode in auth_modes:
+                for sc in scopes:
                     try:
-                        payload = {"grant_type": "client_credentials"}
-                        if sc:
-                            payload["scope"] = sc
-                        r = _token_post(ep, payload, use_basic)
+                        r = _token_try(ep, sc, auth_mode, cid, sec)
                         if r.status_code == 200:
                             js = r.json()
                             _cached_token = js["access_token"]
                             _token_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
                                 seconds=int(js.get("expires_in", 0)) or 0
                             )
-                            logging.info(f"Token SUNAT renovado (endpoint={'clientesextranet' if 'extranet' in ep else 'clientessol'}, auth={'basic' if use_basic else 'body'}, scope={sc or 'sin'})")
+                            logging.info(f"Token SUNAT renovado (endpoint={ep.split('/v1/')[1].split('/')[0]}, auth={auth_mode}, scope={sc or 'sin scope'})")
                             return _cached_token, _token_exp
-                        logging.warning(f"Token fail: [{ep}] HTTP {r.status_code} - {r.text[:300]}")
+                        last_err = f"[{ep} | auth={auth_mode} | scope={sc}] -> HTTP {r.status_code} - {r.text[:800]}"
+                        logging.warning(f"Token fail: {last_err}")
                     except requests.RequestException as e:
-                        logging.warning(f"Token exception: [{ep}] {repr(e)}")
-
-        raise RuntimeError("No se pudo obtener token SUNAT en ninguno de los intentos.")
+                        last_err = f"[{ep} | auth={auth_mode} | scope={sc}] -> excepción: {repr(e)}"
+                        logging.warning(f"Token exception: {last_err}")
+        raise RuntimeError(f"No se pudo obtener token SUNAT. Último error: {last_err}")
 
 # -------------- Cola ---------------------
 def fetch_batch(cnx, n):
@@ -220,7 +180,7 @@ WHERE IdQueue IN (
     c.close()
     return rows
 
-# -------------- Body SUNAT -------------
+# -------------- Body Postman -------------
 def to_body_postman(row):
     _, _, ruc_em, _, tip, ser, num, femi, tot = row
     fecha_str = None
@@ -250,6 +210,10 @@ def _as_str(v):
         return s if s else None
 
 def map_estado(js):
+    """
+    Mapea 'data.estadoCp':
+      0: NO EXISTE | 1: ACEPTADO | 2: ANULADO | 3: AUTORIZADO | 4: NO AUTORIZADO
+    """
     data = js.get("data") if isinstance(js, dict) else None
     estado_cp = _as_str(data.get("estadoCp")) if isinstance(data, dict) else None
     catalogo = {
@@ -288,27 +252,29 @@ def call_sunat(headers, body):
 
 # -------------- Historial ----------------
 def insert_hist(cnx, row, token_expira_utc, js):
+    """
+    Guarda histórico; Codigo_Respuesta = estadoCp (0–4) cuando existe.
+    """
     _, idf, ruc_em, ruc_rec, tip, ser, num, femi, tot = row
     estado_txt, estado_desc, estado_cp = map_estado(js)
     codigo_respuesta = estado_cp
     mensaje = js.get("message") or js.get("mensaje") or js.get("observacion")
 
-    ahora_lima = now_lima_naive()
     c = cnx.cursor()
     c.execute(f"""
 INSERT INTO {T_HIST}
  (IdFactura,RUC_Emisor,RUC_Receptor,TipoDocumento,Serie,Numero,FechaEmision,ImporteTotal,
-  Estado_SUNAT,Codigo_Respuesta,Mensaje,Token_Expira_UTC,Raw_JSON,Fecha_Registro_Lima)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+  Estado_SUNAT,Codigo_Respuesta,Mensaje,Token_Expira_UTC,Raw_JSON)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (idf, ruc_em, ruc_rec, tip, ser, num, femi, tot,
-               estado_txt, codigo_respuesta, mensaje, token_expira_utc, json.dumps(js, ensure_ascii=False), ahora_lima))
+               estado_txt, codigo_respuesta, mensaje, token_expira_utc, json.dumps(js, ensure_ascii=False)))
     c.close()
     return estado_txt, estado_desc, codigo_respuesta, mensaje
 
 # -------------- Snapshot -----------------
 def upsert_snapshot(cnx, row, estado_txt, estado_desc, codigo_respuesta, mensaje):
     _, idf, ruc_em, ruc_rec, tip, ser, num, femi, tot = row
-    ahora = now_lima_naive()
+    ahora = datetime.datetime.now(datetime.timezone.utc)
     cur = cnx.cursor()
     cur.execute(f"SELECT Estado_Actual, Estado_Descripcion FROM {T_SNAPSHOT} WHERE IdFactura=?", (idf,))
     prev = cur.fetchone()
@@ -341,17 +307,32 @@ WHERE IdFactura=?""",
                 (codigo_respuesta, mensaje, ahora, idf))
     cur.close()
 
-# -------------- UPDATE final --------------
+# -------------- UPDATE final desde Python --------------
 def update_final_from_snapshot(cnx):
+    """
+    Actualiza SOLO columnas SUNAT_* en DATA.FACTURA_COMPRA_BACKUS_CABECERA
+    desde INH.SUNAT_ESTADO_ACTUAL usando OUTPUT a #upd para tener un result set
+    confiable (evita 'No results. Previous SQL was not a query').
+    """
     cur = cnx.cursor()
-    # Diagnóstico opcional
+
+    # 1) Diagnóstico previo (opcional pero útil)
     cur.execute(f"""
 ;WITH SRC AS (
-    SELECT s.IdFactura, s.Estado_Actual, s.Estado_Descripcion, s.Codigo_Respuesta, s.Mensaje,
-           s.Fecha_Primera_Consulta, s.Fecha_Ultima_Consulta, s.Fecha_Ultimo_Cambio, s.Cambio_Estado
+    SELECT
+        s.IdFactura,
+        s.Estado_Actual,
+        s.Estado_Descripcion,
+        s.Codigo_Respuesta,
+        s.Mensaje,
+        s.Fecha_Primera_Consulta,
+        s.Fecha_Ultima_Consulta,
+        s.Fecha_Ultimo_Cambio,
+        s.Cambio_Estado
     FROM {T_SNAPSHOT} s WITH (NOLOCK)
 )
-SELECT COUNT(*) FROM {T_FINAL} d
+SELECT COUNT(*)
+FROM {T_FINAL} d
 JOIN SRC s ON s.IdFactura = d.IdFactura
 WHERE
     ISNULL(d.Estado_SUNAT_ULT,'')         <> ISNULL(s.Estado_Actual,'')
@@ -370,6 +351,7 @@ WHERE
     to_fix = cur.fetchone()[0]
     logging.info(f"[FINAL] Filas con diferencias a actualizar: {to_fix}")
 
+    # 2) UPDATE con OUTPUT a temp table y SELECT COUNT(*) (un solo result set)
     cur.execute(f"""
 SET XACT_ABORT ON;
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
@@ -378,8 +360,16 @@ IF OBJECT_ID('tempdb..#upd') IS NOT NULL DROP TABLE #upd;
 CREATE TABLE #upd (IdFactura INT PRIMARY KEY);
 
 ;WITH SRC AS (
-    SELECT s.IdFactura, s.Estado_Actual, s.Estado_Descripcion, s.Codigo_Respuesta, s.Mensaje,
-           s.Fecha_Primera_Consulta, s.Fecha_Ultima_Consulta, s.Fecha_Ultimo_Cambio, s.Cambio_Estado
+    SELECT
+        s.IdFactura,
+        s.Estado_Actual,
+        s.Estado_Descripcion,
+        s.Codigo_Respuesta,
+        s.Mensaje,
+        s.Fecha_Primera_Consulta,
+        s.Fecha_Ultima_Consulta,
+        s.Fecha_Ultimo_Cambio,
+        s.Cambio_Estado
     FROM {T_SNAPSHOT} s WITH (NOLOCK)
 )
 UPDATE d
@@ -390,7 +380,10 @@ UPDATE d
        d.SUNAT_Cambio_Estado      = CASE WHEN s.Cambio_Estado = 1 THEN 1 ELSE 0 END,
        d.SUNAT_Fecha_Primera      = COALESCE(d.SUNAT_Fecha_Primera, s.Fecha_Primera_Consulta),
        d.SUNAT_Fecha_Ultima       = s.Fecha_Ultima_Consulta,
-       d.SUNAT_Fecha_Cambio       = CASE WHEN s.Cambio_Estado = 1 THEN s.Fecha_Ultimo_Cambio ELSE d.SUNAT_Fecha_Cambio END
+       d.SUNAT_Fecha_Cambio       = CASE WHEN s.Cambio_Estado = 1
+                                         THEN s.Fecha_Ultimo_Cambio
+                                         ELSE d.SUNAT_Fecha_Cambio
+                                    END
   OUTPUT inserted.IdFactura INTO #upd(IdFactura)
   FROM {T_FINAL} AS d WITH (ROWLOCK)
   JOIN SRC s ON s.IdFactura = d.IdFactura;
@@ -398,6 +391,7 @@ UPDATE d
 SELECT COUNT(*) AS Affected FROM #upd;
 """)
     affected = cur.fetchone()[0] if cur.description else 0
+
     cnx.commit()
     cur.close()
     logging.info(f"[FINAL] Columnas SUNAT actualizadas en {affected} filas de {T_FINAL}")
@@ -440,7 +434,7 @@ def process_batch(cnx):
                 cnx.commit()
                 err_cnt += 1
 
-    # Actualiza tabla final tras procesar un lote
+    # Actualiza tabla final desde Python (idempotente)
     try:
         update_final_from_snapshot(cnx)
     except Exception:
@@ -451,42 +445,16 @@ def process_batch(cnx):
 # -------------- Main ---------------------
 def main():
     cnx = sql_cnx()
-    idle_elapsed = 0
     try:
-        # quick ping
+        # chequeo rápido
         cur = cnx.cursor(); cur.execute("SELECT 1"); logging.info(f"SQL OK -> {cur.fetchone()[0]}"); cur.close()
-
-        # **Siempre** intenta actualizar final al inicio (por si snapshot cambió por otras corridas)
-        try:
-            update_final_from_snapshot(cnx)
-        except Exception:
-            logging.exception("Update final inicial falló (continuo).")
 
         while True:
             total, okc, errc = process_batch(cnx)
             if total == 0:
-                if ONE_SHOT:
-                    logging.info("Cola vacía y ONE_SHOT activo → saliendo.")
-                    break
-                time.sleep(IDLE_SLEEP_SEC)
-                idle_elapsed += IDLE_SLEEP_SEC
-                if idle_elapsed >= MAX_IDLE_SEC:
-                    # antes de salir por inactividad, dispara un último update por si acaso
-                    try:
-                        update_final_from_snapshot(cnx)
-                    except Exception:
-                        logging.exception("Update final previo a salida por inactividad falló.")
-                    logging.info("Inactividad máxima alcanzada → saliendo.")
-                    break
+                time.sleep(5)
             else:
-                idle_elapsed = 0
                 logging.info(f"Lote: total={total} ok={okc} err={errc}")
-
-        # **Último** update antes de terminar
-        try:
-            update_final_from_snapshot(cnx)
-        except Exception:
-            logging.exception("Update final al cierre falló.")
     finally:
         cnx.close()
 
